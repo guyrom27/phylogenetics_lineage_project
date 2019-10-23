@@ -27,15 +27,16 @@ import keras
 from sklearn.preprocessing import MultiLabelBinarizer
 
 
-# In[27]:
+# In[143]:
 
 
 import keras.backend as ke
 
-def my_loss(y_true,y_pred,alpha=1,beta=1.5, gamma=0.0,delta=0.08):
-	avg_pred = ke.mean(y_pred,axis=0)
-	return alpha*ke.mean(ke.binary_crossentropy(y_true,y_pred)) + beta*ke.mean(y_pred[:,:24]*y_pred[:,1:]) + delta*ke.mean(y_pred[:,:24]*avg_pred[1:] + y_pred[:,1:]*avg_pred[:24])
-		
+def custom_loss(onehot_groupid):
+    def my_loss(y_true,y_pred,alpha=1,beta=1.5, gamma=0.0,delta=0.08):
+        avg_pred = ke.mean(y_pred,axis=0)
+        return alpha*ke.mean(ke.binary_crossentropy(y_true,y_pred)) + beta*ke.mean(y_pred[:,:24]*y_pred[:,1:]) + delta*ke.mean(y_pred[:,:24]*avg_pred[1:] + y_pred[:,1:]*avg_pred[:24])+ke.mean(onehot_groupid)
+    return my_loss
 
 def my_generator(data):
 	dd = data.groupby(["msid","individual_id"])
@@ -46,7 +47,8 @@ def my_generator(data):
 				continue
 			X = np.array(g[list(range(3,30)) + ["read_num"]],dtype='float32')
 			Y = np.array(multilabel_binarizer.transform(g.raw_labels),dtype='float32')
-			yield [X],Y
+			onehot_labels = np.ones((X.shape[0],2), dtype='float32')
+			yield [X,onehot_labels],Y
 
 
 # In[1]:
@@ -86,7 +88,7 @@ y_train = multilabel_binarizer.transform(train_data.raw_labels)
 y_test = multilabel_binarizer.transform(test_data.raw_labels)
 
 
-# In[ ]:
+# In[131]:
 
 
 train_rfe = train_data[list(range(3,30)) + ["read_num"]]
@@ -94,7 +96,9 @@ test_rfe = test_data[list(range(3,30)) + ["read_num"]]
 
 DPLVL = 0.03
 DNSS = 256
+
 input2 = Input(shape=(test_rfe.shape[1],), dtype='float32')
+input3 = Input(shape=(2,), dtype='float32')
 x = input2
 
 x = Dropout(DPLVL, noise_shape=None, seed=None)(Dense(DNSS, activation='linear')(x))
@@ -102,14 +106,14 @@ for _ in range(6):
     x = Dropout(DPLVL, noise_shape=None, seed=None)(Dense(DNSS, activation='relu')(x))
 
 main_output = Dense(len(multilabel_binarizer.classes_), activation='sigmoid', name='main_output')(x)
-model = Model([input2], main_output)
+model = Model(inputs=[input2,input3], outputs=main_output)
 
-model.compile(optimizer=keras.optimizers.Adam(), loss='binary_crossentropy',metrics=[metrics.categorical_accuracy])
+model.compile(optimizer=keras.optimizers.Adam(), loss=custom_loss(input3),metrics=[metrics.categorical_accuracy])
 
 model.summary()
 
 
-# In[25]:
+# In[75]:
 
 
 es_cb = keras.callbacks.EarlyStopping(monitor='val_loss',
@@ -128,12 +132,11 @@ model.fit([train_rfe], y_train, epochs=int(2),
          callbacks=[es_cb, mc_cb])
 
 
-# In[32]:
+# In[147]:
 
 
-#model.fit_generator(my_generator(train_data), epochs=int(2),
-#            validation_data=([test_rfe],y_test), steps_per_epoch=len(train_groups),
-#            callbacks=[es_cb, mc_cb])
+model.fit_generator(my_generator(train_data), epochs=int(2),
+            steps_per_epoch=len(train_groups))
 
 
 # In[ ]:
