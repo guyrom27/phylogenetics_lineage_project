@@ -24,7 +24,7 @@ import frogress
 import keras.callbacks, keras.optimizers
 import keras
 
-from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.preprocessing import MultiLabelBinarizer, LabelBinarizer
 
 import keras.backend as ke
 
@@ -34,19 +34,16 @@ import keras.backend as ke
 
 #from clineage.utils.groups
 import itertools
-def grouper(n, iterable):
-    it = iter(iterable)
-    while True:
-        chunk = tuple(itertools.islice(it, n))
-        if not chunk:
-            return
-        yield chunk
-
+def grouper(iterable, n, fillvalue=None):
+    "Collect data into fixed-length chunks or blocks"
+    # grouper('ABCDEFG', 3, 'x') --> ABC DEF Gxx
+    args = [iter(iterable)] * n
+    return zip(*args)
 
 # In[1]:
 
 
-df_mono = pd.read_pickle("/home/dcsoft/s/Ofir/df_m_sr_panel_bi_2019_08_26.pickle")		
+df_mono = pd.read_pickle("/home/dcsoft/s/Ofir/df_m_sr_panel_bi_2019_08_26.pickle")
 
 
 # In[21]:
@@ -57,6 +54,11 @@ df_mono = pd.read_pickle("/home/dcsoft/s/Ofir/df_m_sr_panel_bi_2019_08_26.pickle
 filt = lambda x: ~np.isnan(x) and x >= 0
 minus5 = lambda x: x-5
 df_mono['raw_labels'] = pd.Series([list(filter(filt, map(minus5,row))) for row in df_mono[['bi_allele1','bi_allele2']].values.tolist()], df_mono.index)
+#df_mono['raw_labels'] = pd.Series([list(filter(filt, map(minus5,row))) for row in df_mono[['pseudo_allele1','pseudo_allele2']].values.tolist()], df_mono.index)
+
+# remove all rows with no calling label
+
+
 
 
 # In[212]:
@@ -89,6 +91,9 @@ test_rfe = test_data[list(range(3,30)) + ["read_num"]]
 n_calsses = len(multilabel_binarizer.classes_)
 
 
+ind_id_binarizer = LabelBinarizer()
+ind_id_binarizer.fit(df_mono.individual_id.astype(str))
+
 # In[214]:
 
 
@@ -106,7 +111,7 @@ DNSS = 256
 BATCH_G_S = 300
 
 #Define inputs
-input_hists_read_num = Input(shape=(test_rfe.shape[1],), dtype='float32')
+input_hists_read_num = Input(shape=(train_rfe.shape[1] +  len(ind_id_binarizer.classes_),), dtype='float32')
 input_group_id_onehot = Input(shape=(BATCH_G_S,), dtype='float')
 
 #Build compute
@@ -122,7 +127,8 @@ main_output = Dense(n_calsses, activation='sigmoid', name='main_output')(x)
 
 
 def custom_loss(grp_enc):
-    def my_loss(y_true,y_pred,alpha=1,beta=1.5, gamma=0.0,delta=0.08):
+#def custom_loss():
+    def my_loss(y_true,y_pred,alpha=1,beta=0.2, gamma=0.0,delta=0.6):
         # b - main batch idx
         # g - group
         # l - label (repeat length)
@@ -130,7 +136,10 @@ def custom_loss(grp_enc):
         exp_grp_avg_pred = tf.einsum('bg,lg->bl', grp_enc, grp_avg_pred) 
         exp_M = exp_grp_avg_pred #for shorthand
 
-        ret =  alpha * ke.mean(ke.binary_crossentropy(y_true,y_pred)) +                beta  * ke.mean(y_pred[:,:-1]*y_pred[:,1:]) +                delta * ke.mean(y_pred[:,:-1]*exp_M[:,1:] + y_pred[:,1:]*exp_M[:,:-1])
+        ret =  alpha * ke.mean(ke.binary_crossentropy(y_true,y_pred)) +
+		beta  * ke.mean(y_pred[:,:-1]*y_pred[:,1:]) + 
+		delta * ke.mean(y_pred[:,:-1]*exp_M[:,1:] + y_pred[:,1:]*exp_M[:,:-1])
+        #ret =  alpha * ke.mean(ke.binary_crossentropy(y_true,y_pred))
         return ret
     return my_loss
 
@@ -141,13 +150,20 @@ def onehot_encoding(X, i):
 
 def my_generator(groupby_obj):
     while 1:
+        group_lst = [groupby_obj.get_group(x) for x in  groupby_obj.groups]
+        random.shuffle(group_lst)
         non_singleton_groups = filter(lambda y: y.shape[0] > 1, 
-                                      map(lambda x: groupby_obj.get_group(x), groupby_obj.groups))
-        for chunk in filter(None, grouper(BATCH_G_S, non_singleton_groups)):
+                                      group_lst)
+        for chunk in filter(None, grouper(non_singleton_groups, BATCH_G_S)):
             X = [np.array(g[list(range(3,30)) + ["read_num"]],dtype='float32') for g in chunk]
+            ind_id_ohe = [np.array(ind_id_binarizer.transform(g.reset_index(drop=True).individual_id.astype(str)),dtype='float32') for g in chunk]
+            
+			#print( np.concatenate(ind_id_ohe).shape)
+            #print(np.concatenate(np.concatenate(X), np.concatenate(ind_id_ohe),axis=1).shape)
             Y = [np.array(multilabel_binarizer.transform(g.raw_labels),dtype='float32') for g in chunk]
             onehot_groupid = [onehot_encoding(x,i) for i,x in enumerate(X)]
-            yield [np.concatenate(X), np.concatenate(onehot_groupid)],np.concatenate(Y)
+            yield [np.concatenate([np.concatenate(X), np.concatenate(ind_id_ohe)],axis=1), np.concatenate(onehot_groupid)],np.concatenate(Y)
+            #yield [np.concatenate(X)],np.concatenate(Y)
 
 
 # In[216]:
@@ -155,12 +171,14 @@ def my_generator(groupby_obj):
 
 #Model
 model = Model(inputs=[input_hists_read_num,input_group_id_onehot], outputs=main_output)
+#model = Model(inputs=[input_hists_read_num], outputs=main_output)
 
 
 # In[224]:
 
 
-model.compile(optimizer=keras.optimizers.Adam(), loss=custom_loss(input_group_id_onehot),metrics=[metrics.categorical_accuracy])
+model.compile(optimizer=keras.optimizers.Adam(), loss=custom_loss(input_group_id_onehot),metrics=[metrics.binary_accuracy])
+#model.compile(optimizer=keras.optimizers.Adam(), loss=custom_loss(),metrics=[metrics.binary_accuracy])
 
 
 # In[218]:
@@ -183,15 +201,15 @@ mc_cb = keras.callbacks.ModelCheckpoint('sim2_model.h5', monitor='val_loss', mod
 # In[226]:
 
 
-EPOCHS = 2
+EPOCHS = 20000
 
 
 # In[26]:
 
 
-model.fit([train_rfe], y_train, epochs=EPOCHS,
-         validation_data=([test_rfe],y_test), batch_size=int(10240),
-         callbacks=[es_cb, mc_cb])
+#model.fit([train_rfe], y_train, epochs=EPOCHS,
+#         validation_data=([test_rfe],y_test), batch_size=int(10240),
+#         callbacks=[es_cb, mc_cb])
 
 
 # In[227]:
@@ -210,13 +228,4 @@ model.fit_generator(my_generator(train_groupby), epochs=EPOCHS,
 
 
 # In[ ]:
-
-
-filter
-
-
-# In[ ]:
-
-
-
 
