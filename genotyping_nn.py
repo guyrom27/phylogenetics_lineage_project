@@ -10,6 +10,7 @@ import numpy as np
 import sklearn as sk
 import xgboost as xgb
 from keras.utils import to_categorical
+import tensorflow as tf
 import collections
 import random
 
@@ -97,6 +98,7 @@ ind_id_binarizer.fit(df_mono.individual_id.astype(str))
 # In[214]:
 
 
+
 #        ------------Model-----------
 
 #Drop out level
@@ -143,29 +145,29 @@ def custom_loss(grp_enc):
         return ret
     return my_loss
 
-def onehot_encoding(X, i):
-    OHE = np.zeros((X.shape[0],BATCH_G_S), dtype='float32')
+def onehot_encoding(X, i, bins=None):
+    if bins == None:
+        bins = BATCH_G_S
+    OHE = np.zeros((X.shape[0],bins), dtype='float32')
     OHE[:,i] = 1.0
     return OHE
+	
+def preprocess_groupby(groupby_obj, df_mono):
+    ind_ids = {ind_id:i for i,ind_id in enumerate(df_mono.individual_id.unique())}
+    group_lst = [groupby_obj.get_group(x) for x in  groupby_obj.groups]
+    group_X__Y = [(np.concatenate([np.array(x[list(range(3,30)) + ["read_num"]],dtype='float32'), \
+                        onehot_encoding(x,ind_ids[x.individual_id.iloc[0]],bins=len(ind_ids))],axis=1), \
+                         np.array(multilabel_binarizer.transform(x.raw_labels),dtype='float32')) \
+                        for x in  group_lst if len(x) > 1]
+    return group_X__Y
 
-def my_generator(groupby_obj):
+def my_generator(group_X__Y):
     while 1:
-        group_lst = [groupby_obj.get_group(x) for x in  groupby_obj.groups]
-        random.shuffle(group_lst)
-        non_singleton_groups = filter(lambda y: y.shape[0] > 1, 
-                                      group_lst)
-        for chunk in filter(None, grouper(non_singleton_groups, BATCH_G_S)):
-            X = [np.array(g[list(range(3,30)) + ["read_num"]],dtype='float32') for g in chunk]
-            ind_id_ohe = [np.array(ind_id_binarizer.transform(g.reset_index(drop=True).individual_id.astype(str)),dtype='float32') for g in chunk]
-            
-			#print( np.concatenate(ind_id_ohe).shape)
-            #print(np.concatenate(np.concatenate(X), np.concatenate(ind_id_ohe),axis=1).shape)
-            Y = [np.array(multilabel_binarizer.transform(g.raw_labels),dtype='float32') for g in chunk]
-            onehot_groupid = [onehot_encoding(x,i) for i,x in enumerate(X)]
-            yield [np.concatenate([np.concatenate(X), np.concatenate(ind_id_ohe)],axis=1), np.concatenate(onehot_groupid)],np.concatenate(Y)
-            #yield [np.concatenate(X)],np.concatenate(Y)
-
-
+        random.shuffle(group_X__Y)
+        for chunk in filter(None, grouper(group_X__Y, BATCH_G_S)):
+            onehot_groupid = [onehot_encoding(x[0],i) for i,x in enumerate(chunk)]
+            yield [np.concatenate([x[0] for x in chunk]), np.concatenate(onehot_groupid)],np.concatenate([x[1] for x in chunk])
+			
 # In[216]:
 
 
@@ -222,8 +224,9 @@ def batches_in_epoch(train_groups,groups_by_batch):
 
 # In[241]:
 
+preprocessed_groups = preprocess_groupby(train_groupby, df_mono)
 
-model.fit_generator(my_generator(train_groupby), epochs=EPOCHS,
+model.fit_generator(my_generator(preprocessed_groups), epochs=EPOCHS,
             steps_per_epoch=batches_in_epoch(train_groups,BATCH_G_S))
 
 
